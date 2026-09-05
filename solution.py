@@ -90,14 +90,20 @@ GOLD_CAP = 0.10
 
 
 def build_signal(hist, params) -> pd.Series:
-    """Score per asset. Positive means overweight, negative means underweight.
+    """Score each asset based on its recent momentum. Positive momentum = positive score = overweight. Negative momentum = negative score = underweight. """
+    # Look at the last 60 trading days 
+    lookback = 60
 
-    Naive placeholder: inverse volatility. Lower-volatility assets score
-    higher. That is a statement about risk, not about return -- replace it.
-    """
-    vol = hist.returns.tail(int(params["vol_days"])).std() * np.sqrt(252)
-    score = (1.0 / vol.replace(0.0, np.nan)).reindex(hist.assets).fillna(0.0)
+    # Get the price from 60 trading days ago and the most recent price
+    prices = hist.prices.tail(lookback + 1)
 
+    if len(prices) < lookback + 1: 
+        return pd.Series(0.0, index=hist.assets) 
+
+    momentum = prices.iloc[-1] / prices.iloc[0] - 1.0
+    # Make sure the assets are in the correct order
+    score = momentum.reindex(hist.assets).fillna(0.0)
+    
     # standardise so the signal scale is stable through time
     if score.std() > 0:
         score = (score - score.mean()) / score.std()
