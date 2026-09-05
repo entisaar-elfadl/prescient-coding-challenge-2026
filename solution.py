@@ -41,7 +41,6 @@ Run `python harness.py` to test on the practice window (calendar 2025), then
 """
 from __future__ import annotations
 
-from matplotlib.pyplot import hist
 import numpy as np
 import pandas as pd
 
@@ -50,9 +49,8 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "lookback": 40,       # Lookback window for trend and volatility
-    "tilt_size": 0.07,     # Active tilt scale factor
-    "trade_speed": 0.06,   # Low trade speed to eliminate transaction drag
+    "tilt_scale": 0.06,      # Active tilt aggressiveness (~12-15% active weight)
+    "rebal_thresh": 0.012,   # Rebalance threshold filter to minimize cost drag
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -91,44 +89,62 @@ GOLD_CAP = 0.10
 
 def build_signal(hist, params) -> pd.Series:
     """
-    1. Carry Extraction: Overweight SA Bonds when real yields are high.
-    2. FX Volatility Regime: Shift to Global Equity/Gold when ZAR is unstable.
-    3. Slow Momentum: Low-turnover cross-sectional ranking.
+    Combines long-term risk metrics with macro regime indicators.
     """
-    prices = hist.prices
+    assets = hist.assets
     returns = hist.returns
     macro = hist.macro
-    
-    lb = int(params["lookback"])
-    recent_rets = returns.tail(lb)
-    
-    # 1. Risk-Adjusted Return (Sharpe-like ranking)
-    vol = recent_rets.std() * np.sqrt(252)
-    cum_ret = (prices.iloc[-1] / prices.iloc[-lb]) - 1.0
-    signal = (cum_ret / vol.replace(0.0, np.nan)).fillna(0.0)
 
-    # 2. SA Bond Carry Engine (High yield, low transaction cost)
-    if "sa_10y" in macro.columns and "sa_repo" in macro.columns:
-        curve_slope = macro["sa_10y"].iloc[-1] - macro["sa_repo"].iloc[-1]
-        if curve_slope > 2.0:  # Steep curve: overweight bonds vs cash
-            signal["SA_BONDS"] += 0.5
-            signal["SA_CASH"] -= 0.3
+    # Require minimum historical history
+    if len(returns) < 252:
+        return pd.Series(0.0, index=assets)
 
-    # 3. Macro FX Shield (USDZAR Volatility Spike)
-    if "usdzar" in macro.columns and len(macro["usdzar"]) >= 20:
-        zar_vol = macro["usdzar"].pct_change().tail(20).std() * np.sqrt(252)
-        if zar_vol > 0.12:  # High ZAR volatility -> risk off
-            signal["GLOBAL_EQUITY"] += 0.4
-            signal["GOLD"] += 0.4
-            signal["SA_PROPERTY"] -= 0.6
-            signal["SA_EQUITY"] -= 0.3
+    # 1. Long-Term Risk Normalization (Using full history)
+    # Volatility estimated across all available past data
+    long_term_vol = returns.std() * np.sqrt(252)
+    long_term_vol = long_term_vol.replace(0.0, np.nan).fillna(0.12)
 
-    # Standardize signal
-    score = signal.reindex(hist.assets).fillna(0.0)
-    if score.std() > 0:
-        score = (score - score.mean()) / score.std()
-        
-    return score
+    # Long-Term Sharpe/Return Expectation
+    # Assets with higher long-term risk-adjusted returns get baseline preference
+    mean_ret = returns.mean() * 252
+    base_signal = mean_ret / long_term_vol
+
+    # 2. Dynamic Macro Regimes
+    macro_tilt = pd.Series(0.0, index=assets)
+    if len(macro) >= 60:
+        latest = macro.iloc[-1]
+        past_60 = macro.iloc[-60]
+
+        # A. Term Spread (SA Yield Curve) -> Shift between Bonds and Cash
+        sa_10y = latest.get("sa_10y", 9.5)
+        sa_repo = latest.get("sa_repo", 7.0)
+        spread = (sa_10y - sa_repo) / 100.0
+
+        macro_tilt["SA_BONDS"] += spread * 1.5
+        macro_tilt["SA_CASH"] -= spread * 1.5
+
+        # B. Rand FX Trend (USD/ZAR 60-day change) -> Rand Shock Protection
+        usdzar_now = latest.get("usdzar", 18.0)
+        usdzar_past = past_60.get("usdzar", usdzar_now)
+        zar_change = (usdzar_now / usdzar_past) - 1.0
+
+        macro_tilt["GLOBAL_EQUITY"] += zar_change * 1.0
+        macro_tilt["GOLD"] += zar_change * 1.0
+
+    # Combined composite signal
+    raw_signal = base_signal + macro_tilt
+
+    # Cost-Awareness Penalties (Property = 35 bps, Gold = 25 bps fee penalty)
+    raw_signal["SA_PROPERTY"] *= 0.25
+    raw_signal["GOLD"] *= 0.50
+
+    # Cross-sectional standardization
+    if raw_signal.std() > 1e-6:
+        signal = (raw_signal - raw_signal.mean()) / raw_signal.std()
+    else:
+        signal = pd.Series(0.0, index=assets)
+
+    return signal
 
 
 def make_legal(weights: pd.Series, hist) -> pd.Series:
@@ -181,19 +197,27 @@ def make_legal(weights: pd.Series, hist) -> pd.Series:
 
 
 def generate_weights(hist, prev_weights, params):
+    """Return portfolio weights to hold on hist.date."""
     bm = hist.benchmark
 
-    if len(hist.returns) < 260:
+    if len(hist.returns) < 252:
         return bm.to_dict()
 
+    # Calculate optimal target
     signal = build_signal(hist, params)
-    target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
+    target = make_legal(bm + float(params["tilt_scale"]) * signal, hist)
 
-    # Slow trade speed minimizes transaction drag
+    # Inertia rebalance filter: Only execute trades that exceed the rebalance threshold
     prev = prev_weights.reindex(hist.assets)
-    w = prev + float(params["trade_speed"]) * (target - prev)
+    diff = target - prev
+    thresh = float(params["rebal_thresh"])
 
-    return make_legal(w, hist).to_dict()
+    adjusted_target = prev.copy()
+    for asset in hist.assets:
+        if abs(diff[asset]) > thresh:
+            adjusted_target[asset] = target[asset]
+
+    return make_legal(adjusted_target, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
