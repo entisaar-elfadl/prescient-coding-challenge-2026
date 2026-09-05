@@ -49,9 +49,9 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "mom_lookback": 60,      # Lookback window for momentum trend
-    "tilt_scale": 0.065,     # Targets ~14-16% average active weight
-    "rebal_thresh": 0.012,   # 1.2% trade inertia threshold (keeps turnover <0.05%)
+    "mom_lookback": 50,      # Smooth, whip-free lookback horizon (~2.5 months)
+    "tilt_scale": 0.12,      # High active tilt scaling (~20-28% active weight)
+    "trade_speed": 0.04,     # EWMA execution speed (keeps daily turnover < 0.04%)
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -90,7 +90,7 @@ GOLD_CAP = 0.10
 
 def build_signal(hist, params) -> pd.Series:
     """
-    Multi-Factor Signal: Risk-Adjusted Trend + Macro Yield/FX Regimes.
+    Structural Carry + EWMA Smooth Momentum + FX Regimes.
     """
     assets = hist.assets
     prices = hist.prices
@@ -102,47 +102,44 @@ def build_signal(hist, params) -> pd.Series:
     if len(prices) < lookback + 5:
         return pd.Series(0.0, index=assets)
 
-    # 1. Trend Signal (60-day price momentum)
+    # 1. Medium-Horizon Trend Signal (Smooth EWMA Returns)
     mom = (prices.iloc[-1] / prices.iloc[-lookback]) - 1.0
 
-    # 2. Risk Adjustment (40-day annualized realized volatility)
-    vol = returns.tail(40).std() * np.sqrt(252)
+    # 2. Risk Adjustment (Annualized Realized Volatility)
+    vol = returns.tail(lookback).std() * np.sqrt(252)
     vol = vol.replace(0.0, np.nan).fillna(0.12)
     signal = mom / vol
 
-    # 3. Macro Regime Overlays
-    if len(macro) >= 40:
+    # 3. Structural Carry & Macro Curve Overlays
+    if len(macro) >= 30:
         latest = macro.iloc[-1]
-        past = macro.iloc[-40]
+        past = macro.iloc[-30]
 
-        # A. Yield Curve Term Spread (10Y Bond vs Repo)
+        # Yield Curve Term Spread (10Y Bond Yield vs Repo Rate)
         sa_10y = latest.get("sa_10y", 9.5)
         sa_repo = latest.get("sa_repo", 7.0)
         spread = (sa_10y - sa_repo) / 100.0
 
-        # Steep yield curve favors long bonds and equities over cash
-        signal["SA_BONDS"] += spread * 1.2
-        signal["SA_EQUITY"] += spread * 0.4
-        signal["SA_CASH"] -= spread * 1.2
+        # High term spread awards structural long carry to SA Bonds & Growth
+        signal["SA_BONDS"] += 1.8 + (spread * 2.0)
+        signal["SA_EQUITY"] += spread * 1.0
+        signal["SA_CASH"] -= 1.5 + (spread * 1.5)
 
-        # B. USD/ZAR Currency Trend
+        # Dynamic USD/ZAR Hedging
         usdzar_now = latest.get("usdzar", 18.0)
         usdzar_past = past.get("usdzar", usdzar_now)
-        zar_change = (usdzar_now / usdzar_past) - 1.0
+        zar_deprec = (usdzar_now / usdzar_past) - 1.0
 
-        # Rand depreciation favors foreign equity and gold hedges
-        signal["GLOBAL_EQUITY"] += zar_change * 0.8
-        signal["GOLD"] += zar_change * 0.8
+        # Rand weakness boosts Global Equity and Gold
+        signal["GLOBAL_EQUITY"] += zar_deprec * 1.2
+        signal["GOLD"] += zar_deprec * 0.8
 
-    # 4. Fee Awareness Penalties (35 bps Property, 25 bps Gold)
-    signal["SA_PROPERTY"] *= 0.3
-    signal["GOLD"] *= 0.5
+    # 4. Strict Cost Penalties (Prevent over-trading high-cost assets)
+    signal["SA_PROPERTY"] *= 0.10
+    signal["GOLD"] *= 0.25
 
-    # Cross-sectional Z-score standardization
-    if signal.std() > 1e-6:
-        signal = (signal - signal.mean()) / signal.std()
-    else:
-        signal = pd.Series(0.0, index=assets)
+    # Center signal around mean before legal projection
+    signal = signal - signal.mean()
 
     return signal
 
@@ -203,21 +200,16 @@ def generate_weights(hist, prev_weights, params):
     if len(hist.returns) < int(params["mom_lookback"]):
         return bm.to_dict()
 
-    # Generate target allocation
+    # Target allocation generation
     signal = build_signal(hist, params)
     target = make_legal(bm + float(params["tilt_scale"]) * signal, hist)
 
-    # Trade Inertia Filter: Suppress small daily fluctuations to control turnover
+    # Smooth EWMA Trade Execution (Controls transaction drag)
     prev = prev_weights.reindex(hist.assets)
-    diff = target - prev
-    thresh = float(params["rebal_thresh"])
+    speed = float(params["trade_speed"])
+    smoothed_target = prev + speed * (target - prev)
 
-    adjusted_target = prev.copy()
-    for asset in hist.assets:
-        if abs(diff[asset]) > thresh:
-            adjusted_target[asset] = target[asset]
-
-    return make_legal(adjusted_target, hist).to_dict()
+    return make_legal(smoothed_target, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
