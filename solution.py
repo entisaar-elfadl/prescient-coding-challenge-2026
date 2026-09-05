@@ -49,9 +49,9 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "vol_days": 20,         # Short lookback -> dynamic, fast-changing signals
-    "tilt_size": 0.08,      # Target larger active tilts
-    "trade_speed": 0.50,    # Close 50% of weight gap daily (high turnover)
+    "mom_lookback": 60,      # Lookback window for momentum trend
+    "tilt_scale": 0.065,     # Targets ~14-16% average active weight
+    "rebal_thresh": 0.012,   # 1.2% trade inertia threshold (keeps turnover <0.05%)
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -89,21 +89,56 @@ GOLD_CAP = 0.10
 
 
 def build_signal(hist, params) -> pd.Series:
-    """Fast-moving, short-horizon risk-adjusted signal."""
+    """
+    Multi-Factor Signal: Risk-Adjusted Trend + Macro Yield/FX Regimes.
+    """
     assets = hist.assets
+    prices = hist.prices
     returns = hist.returns
-    lookback = int(params["vol_days"])
+    macro = hist.macro
 
-    if len(returns) < lookback:
+    lookback = int(params["mom_lookback"])
+
+    if len(prices) < lookback + 5:
         return pd.Series(0.0, index=assets)
 
-    # Short-term 20-day return momentum normalized by realized volatility
-    recent_ret = (1 + returns.tail(lookback)).prod() - 1.0
-    vol = returns.tail(lookback).std() * np.sqrt(252)
+    # 1. Trend Signal (60-day price momentum)
+    mom = (prices.iloc[-1] / prices.iloc[-lookback]) - 1.0
+
+    # 2. Risk Adjustment (40-day annualized realized volatility)
+    vol = returns.tail(40).std() * np.sqrt(252)
     vol = vol.replace(0.0, np.nan).fillna(0.12)
+    signal = mom / vol
 
-    signal = recent_ret / vol
+    # 3. Macro Regime Overlays
+    if len(macro) >= 40:
+        latest = macro.iloc[-1]
+        past = macro.iloc[-40]
 
+        # A. Yield Curve Term Spread (10Y Bond vs Repo)
+        sa_10y = latest.get("sa_10y", 9.5)
+        sa_repo = latest.get("sa_repo", 7.0)
+        spread = (sa_10y - sa_repo) / 100.0
+
+        # Steep yield curve favors long bonds and equities over cash
+        signal["SA_BONDS"] += spread * 1.2
+        signal["SA_EQUITY"] += spread * 0.4
+        signal["SA_CASH"] -= spread * 1.2
+
+        # B. USD/ZAR Currency Trend
+        usdzar_now = latest.get("usdzar", 18.0)
+        usdzar_past = past.get("usdzar", usdzar_now)
+        zar_change = (usdzar_now / usdzar_past) - 1.0
+
+        # Rand depreciation favors foreign equity and gold hedges
+        signal["GLOBAL_EQUITY"] += zar_change * 0.8
+        signal["GOLD"] += zar_change * 0.8
+
+    # 4. Fee Awareness Penalties (35 bps Property, 25 bps Gold)
+    signal["SA_PROPERTY"] *= 0.3
+    signal["GOLD"] *= 0.5
+
+    # Cross-sectional Z-score standardization
     if signal.std() > 1e-6:
         signal = (signal - signal.mean()) / signal.std()
     else:
@@ -162,21 +197,27 @@ def make_legal(weights: pd.Series, hist) -> pd.Series:
 
 
 def generate_weights(hist, prev_weights, params):
-    """Generates portfolio weights with aggressive daily rebalancing."""
+    """Return portfolio weights to hold on hist.date."""
     bm = hist.benchmark
 
-    if len(hist.returns) < int(params["vol_days"]):
+    if len(hist.returns) < int(params["mom_lookback"]):
         return bm.to_dict()
 
+    # Generate target allocation
     signal = build_signal(hist, params)
-    target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
+    target = make_legal(bm + float(params["tilt_scale"]) * signal, hist)
 
-    # Rebalance aggressively toward target every single day
+    # Trade Inertia Filter: Suppress small daily fluctuations to control turnover
     prev = prev_weights.reindex(hist.assets)
-    speed = float(params["trade_speed"])
-    w = prev + speed * (target - prev)
+    diff = target - prev
+    thresh = float(params["rebal_thresh"])
 
-    return make_legal(w, hist).to_dict()
+    adjusted_target = prev.copy()
+    for asset in hist.assets:
+        if abs(diff[asset]) > thresh:
+            adjusted_target[asset] = target[asset]
+
+    return make_legal(adjusted_target, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
