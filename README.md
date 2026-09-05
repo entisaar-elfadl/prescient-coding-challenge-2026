@@ -248,3 +248,6 @@ most common way to throw away three hours of good work.
 
 Good luck. Come find us at lunch - we are happy to talk about the problem, about
 Prescient, and about what working here actually looks like.
+
+Vid
+https://drive.google.com/file/d/1laCY8j39znn4w-qVwsHtxT1yKMTLx8jx/view?usp=drivesdk
