@@ -49,10 +49,9 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "mom_lookback": 60,     # Medium-term momentum lookback (60 trading days)
-    "vol_lookback": 40,     # Volatility normalization window
-    "tilt_size": 0.08,      # Active tilt aggressiveness (~15-20% active weight)
-    "trade_speed": 0.08,    # Smooth rebalancing to avoid turnover friction
+    "mom_lookback": 50,      # 50-day momentum signal window
+    "tilt_size": 0.07,       # Active tilt aggressiveness (~15% active weight)
+    "rebal_threshold": 0.015  # Minimum weight drift required to initiate trade
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -91,35 +90,31 @@ GOLD_CAP = 0.10
 
 def build_signal(hist, params) -> pd.Series:
     """
-    Robust Cross-Sectional Risk-Adjusted Momentum Signal.
-    Calculates 60-day momentum normalized by recent volatility.
+    Risk-Adjusted Asset Momentum Signal with Fee Protection.
     """
     assets = hist.assets
     prices = hist.prices
     returns = hist.returns
 
     lookback = int(params["mom_lookback"])
-    vol_look = int(params["vol_lookback"])
 
     if len(prices) < lookback + 5:
         return pd.Series(0.0, index=assets)
 
-    # 1. Price Momentum (60-day asset return)
+    # 1. Calculate 50-day cumulative returns
     mom = (prices.iloc[-1] / prices.iloc[-lookback]) - 1.0
 
-    # 2. Asset Volatility Normalization
-    vol = returns.tail(vol_look).std() * np.sqrt(252)
-    vol = vol.replace(0.0, np.nan).fillna(0.15)
-
-    # 3. Risk-Adjusted Return Signal (Sharpe-like ratio per asset)
+    # 2. Normalize by short-term annualized volatility (30-day)
+    vol = returns.tail(30).std() * np.sqrt(252)
+    vol = vol.replace(0.0, np.nan).fillna(0.12)
     signal = mom / vol
 
-    # Cost-awareness penalty for high-fee assets (Property = 35 bps, Gold = 25 bps)
-    # Reduces over-trading on expensive assets
-    signal["SA_PROPERTY"] *= 0.5
-    signal["GOLD"] *= 0.7
+    # 3. Penalize high-fee assets to minimize cost drag
+    # (Property = 35 bps, Gold = 25 bps)
+    signal["SA_PROPERTY"] *= 0.3
+    signal["GOLD"] *= 0.5
 
-    # Standardize cross-sectionally to create balanced tilts
+    # Standardize cross-sectionally
     if signal.std() > 1e-6:
         signal = (signal - signal.mean()) / signal.std()
     else:
@@ -189,11 +184,18 @@ def generate_weights(hist, prev_weights, params):
     signal = build_signal(hist, params)
     target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
 
-    # 2. trade gradually toward the target rather than jumping to it
+    # Rebalance only when target differs significantly from previous weight
     prev = prev_weights.reindex(hist.assets)
-    w = prev + float(params["trade_speed"]) * (target - prev)
+    diff = target - prev
+    
+    # Inertia filter: ignore minor rebalance noise to eliminate cost drag
+    thresh = float(params["rebal_threshold"])
+    adjusted_target = prev.copy()
+    for asset in hist.assets:
+        if abs(diff[asset]) > thresh:
+            adjusted_target[asset] = target[asset]
 
-    return make_legal(w, hist).to_dict()
+    return make_legal(adjusted_target, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
