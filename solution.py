@@ -49,9 +49,11 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "vol_days":    250,     # lookback for the volatility estimate
-    "tilt_size":   0.06,    # how far a 1-sigma signal moves a weight
-    "trade_speed": 0.10,    # fraction of the gap to yesterday we close per day
+    "mom_fast": 20,         # Short window for momentum/trend confirmation
+    "mom_slow": 100,        # Long window for trend confirmation
+    "tilt_size": 0.09,      # Active tilt aggressiveness (0.05 - 0.10)
+    "trade_speed": 0.04,    # Slow trading speed to control cost drag
+
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -60,6 +62,16 @@ ACTIVE_BUDGET = 0.40     # total, summed over assets
 EQUITY = ["SA_EQUITY", "GLOBAL_EQUITY"]
 EQUITY_CAP = 0.75        # total equity, whatever the bands allow
 GOLD_CAP = 0.10
+
+# One-way trading costs in bps for cost-dampening adjustments
+COST_DAMPENER = {
+    "SA_EQUITY": 1.0,
+    "GLOBAL_EQUITY": 1.0,
+    "SA_BONDS": 1.0,
+    "SA_CASH": 1.0,
+    "SA_PROPERTY": 0.45,  # 35 bps cost -> reduce turnover aggressiveness
+    "GOLD": 0.55,         # 25 bps cost -> reduce turnover aggressiveness
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -90,24 +102,59 @@ GOLD_CAP = 0.10
 
 
 def build_signal(hist, params) -> pd.Series:
-    """Score each asset based on its recent momentum. Positive momentum = positive score = overweight. Negative momentum = negative score = underweight. """
-    # Look at the last 60 trading days 
-    lookback = 60
+    """
+    Constructs a signal designed to overweight GLOBAL_EQUITY, SA_PROPERTY, GOLD
+    and underweight SA_CASH and SA_BONDS, combining structural bias with
+    trend-following confirmation.
+    """
+    assets = hist.assets
+    prices = hist.prices
 
-    # Get the price from 60 trading days ago and the most recent price
-    prices = hist.prices.tail(lookback + 1)
+    fast_w = int(params["mom_fast"])
+    slow_w = int(params["mom_slow"])
 
-    if len(prices) < lookback + 1: 
-        return pd.Series(0.0, index=hist.assets) 
+    # Fallback if history is insufficient
+    if len(prices) < slow_w + 5:
+        return pd.Series(0.0, index=assets)
 
-    momentum = prices.iloc[-1] / prices.iloc[0] - 1.0
-    # Make sure the assets are in the correct order
-    score = momentum.reindex(hist.assets).fillna(0.0)
-    
-    # standardise so the signal scale is stable through time
-    if score.std() > 0:
-        score = (score - score.mean()) / score.std()
-    return score
+    # 1. Target Structural Bias
+    # Overweight: GLOBAL_EQUITY, SA_PROPERTY, GOLD
+    # Underweight: SA_CASH, SA_BONDS
+    base_bias = pd.Series({
+        "GLOBAL_EQUITY": 1.0,
+        "SA_PROPERTY":   1.0,
+        "GOLD":          1.0,
+        "SA_EQUITY":     0.0,
+        "SA_BONDS":     -1.0,
+        "SA_CASH":      -1.0,
+    }).reindex(assets).fillna(0.0)
+
+    # 2. Market Trend Confirmation Filter (SMA Fast / SMA Slow)
+    sma_fast = prices.tail(fast_w).mean()
+    sma_slow = prices.tail(slow_w).mean()
+    trend = (sma_fast / sma_slow) - 1.0
+
+    # Scale trend by asset return volatility
+    recent_rets = hist.returns.tail(30)
+    vol = recent_rets.std() * np.sqrt(252)
+    vol = vol.replace(0.0, np.nan).fillna(0.12)
+    risk_adj_trend = trend / vol
+
+    # 3. Combine structural bias with trend filter
+    combined_signal = base_bias + 0.5 * risk_adj_trend
+
+    # 4. Apply cost dampener to minimize churn in expensive assets
+    dampener = pd.Series(COST_DAMPENER).reindex(assets).fillna(1.0)
+    damped_signal = combined_signal * dampener
+
+    # Standardize output signal
+    std_dev = damped_signal.std()
+    if std_dev > 1e-6:
+        signal = (damped_signal - damped_signal.mean()) / std_dev
+    else:
+        signal = pd.Series(0.0, index=assets)
+
+    return signal
 
 
 def make_legal(weights: pd.Series, hist) -> pd.Series:
