@@ -49,11 +49,10 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "mom_fast": 20,         # Short window for momentum/trend confirmation
-    "mom_slow": 100,        # Long window for trend confirmation
-    "tilt_size": 0.09,      # Active tilt aggressiveness (0.05 - 0.10)
-    "trade_speed": 0.04,    # Slow trading speed to control cost drag
-
+    "sma_fast": 20,         # Short window for trend detection
+    "sma_slow": 120,        # Long window for trend filter
+    "tilt_size": 0.04,      # Conservative active risk allocation (~10-15% active weight)
+    "trade_speed": 0.05,    # Gradual rebalancing to control transaction fees
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -69,8 +68,8 @@ COST_DAMPENER = {
     "GLOBAL_EQUITY": 1.0,
     "SA_BONDS": 1.0,
     "SA_CASH": 1.0,
-    "SA_PROPERTY": 0.45,  # 35 bps cost -> reduce turnover aggressiveness
-    "GOLD": 0.55,         # 25 bps cost -> reduce turnover aggressiveness
+    "SA_PROPERTY": 0.35,  # High trading cost (35 bps) -> reduce churn
+    "GOLD": 0.50,         # High trading cost (25 bps) -> reduce churn
 }
 
 
@@ -103,51 +102,51 @@ COST_DAMPENER = {
 
 def build_signal(hist, params) -> pd.Series:
     """
-    Constructs a signal designed to overweight GLOBAL_EQUITY, SA_PROPERTY, GOLD
-    and underweight SA_CASH and SA_BONDS, combining structural bias with
-    trend-following confirmation.
+    Purely adaptive trend signal:
+    Compares short moving average (20-day) vs long moving average (120-day),
+    volatility-adjusted and cost-damped without fixed directional bias.
     """
     assets = hist.assets
     prices = hist.prices
 
-    fast_w = int(params["mom_fast"])
-    slow_w = int(params["mom_slow"])
+    fast_w = int(params["sma_fast"])
+    slow_w = int(params["sma_slow"])
 
-    # Fallback if history is insufficient
     if len(prices) < slow_w + 5:
         return pd.Series(0.0, index=assets)
 
-    # 1. Target Structural Bias
-    # Overweight: GLOBAL_EQUITY, SA_PROPERTY, GOLD
-    # Underweight: SA_CASH, SA_BONDS
-    base_bias = pd.Series({
-        "GLOBAL_EQUITY": 1.0,
-        "SA_PROPERTY":   1.0,
-        "GOLD":          1.0,
-        "SA_EQUITY":     0.0,
-        "SA_BONDS":     -1.0,
-        "SA_CASH":      -1.0,
-    }).reindex(assets).fillna(0.0)
-
-    # 2. Market Trend Confirmation Filter (SMA Fast / SMA Slow)
+    # 1. Price Trend (Moving Average Crossover Ratio)
     sma_fast = prices.tail(fast_w).mean()
     sma_slow = prices.tail(slow_w).mean()
     trend = (sma_fast / sma_slow) - 1.0
 
-    # Scale trend by asset return volatility
-    recent_rets = hist.returns.tail(30)
-    vol = recent_rets.std() * np.sqrt(252)
-    vol = vol.replace(0.0, np.nan).fillna(0.12)
-    risk_adj_trend = trend / vol
+    # 2. Risk Adjustment (Annualized Volatility)
+    vol = hist.returns.tail(60).std() * np.sqrt(252)
+    vol = vol.replace(0.0, np.nan).fillna(0.15)
+    
+    risk_adjusted_trend = trend / vol
 
-    # 3. Combine structural bias with trend filter
-    combined_signal = base_bias + 0.5 * risk_adj_trend
+    # 3. Macro Alignment: Term Spread (sa_10y - sa_repo)
+    macro = hist.macro
+    macro_tilt = pd.Series(0.0, index=assets)
+    if len(macro) > 0:
+        latest = macro.iloc[-1]
+        sa_10y = latest.get("sa_10y", 9.5)
+        sa_repo = latest.get("sa_repo", 7.0)
+        spread = (sa_10y - sa_repo) / 100.0  # Scale decimal
+        
+        # Steep curve favors SA_BONDS over SA_CASH
+        macro_tilt["SA_BONDS"] += spread * 1.0
+        macro_tilt["SA_CASH"] -= spread * 1.0
 
-    # 4. Apply cost dampener to minimize churn in expensive assets
+    # Combine signals
+    raw_signal = risk_adjusted_trend + macro_tilt
+
+    # Apply cost dampener
     dampener = pd.Series(COST_DAMPENER).reindex(assets).fillna(1.0)
-    damped_signal = combined_signal * dampener
+    damped_signal = raw_signal * dampener
 
-    # Standardize output signal
+    # Cross-sectional Z-score normalization
     std_dev = damped_signal.std()
     if std_dev > 1e-6:
         signal = (damped_signal - damped_signal.mean()) / std_dev
