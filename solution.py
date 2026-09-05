@@ -49,10 +49,10 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "sma_fast": 20,         # Short window for trend detection
-    "sma_slow": 120,        # Long window for trend filter
-    "tilt_size": 0.04,      # Conservative active risk allocation (~10-15% active weight)
-    "trade_speed": 0.05,    # Gradual rebalancing to control transaction fees
+    "mom_lookback": 60,     # Medium-term momentum lookback (60 trading days)
+    "vol_lookback": 40,     # Volatility normalization window
+    "tilt_size": 0.08,      # Active tilt aggressiveness (~15-20% active weight)
+    "trade_speed": 0.08,    # Smooth rebalancing to avoid turnover friction
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -61,17 +61,6 @@ ACTIVE_BUDGET = 0.40     # total, summed over assets
 EQUITY = ["SA_EQUITY", "GLOBAL_EQUITY"]
 EQUITY_CAP = 0.75        # total equity, whatever the bands allow
 GOLD_CAP = 0.10
-
-# One-way trading costs in bps for cost-dampening adjustments
-COST_DAMPENER = {
-    "SA_EQUITY": 1.0,
-    "GLOBAL_EQUITY": 1.0,
-    "SA_BONDS": 1.0,
-    "SA_CASH": 1.0,
-    "SA_PROPERTY": 0.35,  # High trading cost (35 bps) -> reduce churn
-    "GOLD": 0.50,         # High trading cost (25 bps) -> reduce churn
-}
-
 
 # --------------------------------------------------------------------------- #
 # <<--------------------- YOUR CODE GOES BELOW THIS LINE --------------------->>
@@ -102,54 +91,37 @@ COST_DAMPENER = {
 
 def build_signal(hist, params) -> pd.Series:
     """
-    Purely adaptive trend signal:
-    Compares short moving average (20-day) vs long moving average (120-day),
-    volatility-adjusted and cost-damped without fixed directional bias.
+    Robust Cross-Sectional Risk-Adjusted Momentum Signal.
+    Calculates 60-day momentum normalized by recent volatility.
     """
     assets = hist.assets
     prices = hist.prices
+    returns = hist.returns
 
-    fast_w = int(params["sma_fast"])
-    slow_w = int(params["sma_slow"])
+    lookback = int(params["mom_lookback"])
+    vol_look = int(params["vol_lookback"])
 
-    if len(prices) < slow_w + 5:
+    if len(prices) < lookback + 5:
         return pd.Series(0.0, index=assets)
 
-    # 1. Price Trend (Moving Average Crossover Ratio)
-    sma_fast = prices.tail(fast_w).mean()
-    sma_slow = prices.tail(slow_w).mean()
-    trend = (sma_fast / sma_slow) - 1.0
+    # 1. Price Momentum (60-day asset return)
+    mom = (prices.iloc[-1] / prices.iloc[-lookback]) - 1.0
 
-    # 2. Risk Adjustment (Annualized Volatility)
-    vol = hist.returns.tail(60).std() * np.sqrt(252)
+    # 2. Asset Volatility Normalization
+    vol = returns.tail(vol_look).std() * np.sqrt(252)
     vol = vol.replace(0.0, np.nan).fillna(0.15)
-    
-    risk_adjusted_trend = trend / vol
 
-    # 3. Macro Alignment: Term Spread (sa_10y - sa_repo)
-    macro = hist.macro
-    macro_tilt = pd.Series(0.0, index=assets)
-    if len(macro) > 0:
-        latest = macro.iloc[-1]
-        sa_10y = latest.get("sa_10y", 9.5)
-        sa_repo = latest.get("sa_repo", 7.0)
-        spread = (sa_10y - sa_repo) / 100.0  # Scale decimal
-        
-        # Steep curve favors SA_BONDS over SA_CASH
-        macro_tilt["SA_BONDS"] += spread * 1.0
-        macro_tilt["SA_CASH"] -= spread * 1.0
+    # 3. Risk-Adjusted Return Signal (Sharpe-like ratio per asset)
+    signal = mom / vol
 
-    # Combine signals
-    raw_signal = risk_adjusted_trend + macro_tilt
+    # Cost-awareness penalty for high-fee assets (Property = 35 bps, Gold = 25 bps)
+    # Reduces over-trading on expensive assets
+    signal["SA_PROPERTY"] *= 0.5
+    signal["GOLD"] *= 0.7
 
-    # Apply cost dampener
-    dampener = pd.Series(COST_DAMPENER).reindex(assets).fillna(1.0)
-    damped_signal = raw_signal * dampener
-
-    # Cross-sectional Z-score normalization
-    std_dev = damped_signal.std()
-    if std_dev > 1e-6:
-        signal = (damped_signal - damped_signal.mean()) / std_dev
+    # Standardize cross-sectionally to create balanced tilts
+    if signal.std() > 1e-6:
+        signal = (signal - signal.mean()) / signal.std()
     else:
         signal = pd.Series(0.0, index=assets)
 
