@@ -41,6 +41,7 @@ Run `python harness.py` to test on the practice window (calendar 2025), then
 """
 from __future__ import annotations
 
+from matplotlib.pyplot import hist
 import numpy as np
 import pandas as pd
 
@@ -49,9 +50,9 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "mom_lookback": 50,      # 50-day momentum signal window
-    "tilt_size": 0.07,       # Active tilt aggressiveness (~15% active weight)
-    "rebal_threshold": 0.015  # Minimum weight drift required to initiate trade
+    "lookback": 40,       # Lookback window for trend and volatility
+    "tilt_size": 0.07,     # Active tilt scale factor
+    "trade_speed": 0.06,   # Low trade speed to eliminate transaction drag
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -90,37 +91,44 @@ GOLD_CAP = 0.10
 
 def build_signal(hist, params) -> pd.Series:
     """
-    Risk-Adjusted Asset Momentum Signal with Fee Protection.
+    1. Carry Extraction: Overweight SA Bonds when real yields are high.
+    2. FX Volatility Regime: Shift to Global Equity/Gold when ZAR is unstable.
+    3. Slow Momentum: Low-turnover cross-sectional ranking.
     """
-    assets = hist.assets
     prices = hist.prices
     returns = hist.returns
+    macro = hist.macro
+    
+    lb = int(params["lookback"])
+    recent_rets = returns.tail(lb)
+    
+    # 1. Risk-Adjusted Return (Sharpe-like ranking)
+    vol = recent_rets.std() * np.sqrt(252)
+    cum_ret = (prices.iloc[-1] / prices.iloc[-lb]) - 1.0
+    signal = (cum_ret / vol.replace(0.0, np.nan)).fillna(0.0)
 
-    lookback = int(params["mom_lookback"])
+    # 2. SA Bond Carry Engine (High yield, low transaction cost)
+    if "sa_10y" in macro.columns and "sa_repo" in macro.columns:
+        curve_slope = macro["sa_10y"].iloc[-1] - macro["sa_repo"].iloc[-1]
+        if curve_slope > 2.0:  # Steep curve: overweight bonds vs cash
+            signal["SA_BONDS"] += 0.5
+            signal["SA_CASH"] -= 0.3
 
-    if len(prices) < lookback + 5:
-        return pd.Series(0.0, index=assets)
+    # 3. Macro FX Shield (USDZAR Volatility Spike)
+    if "usdzar" in macro.columns and len(macro["usdzar"]) >= 20:
+        zar_vol = macro["usdzar"].pct_change().tail(20).std() * np.sqrt(252)
+        if zar_vol > 0.12:  # High ZAR volatility -> risk off
+            signal["GLOBAL_EQUITY"] += 0.4
+            signal["GOLD"] += 0.4
+            signal["SA_PROPERTY"] -= 0.6
+            signal["SA_EQUITY"] -= 0.3
 
-    # 1. Calculate 50-day cumulative returns
-    mom = (prices.iloc[-1] / prices.iloc[-lookback]) - 1.0
-
-    # 2. Normalize by short-term annualized volatility (30-day)
-    vol = returns.tail(30).std() * np.sqrt(252)
-    vol = vol.replace(0.0, np.nan).fillna(0.12)
-    signal = mom / vol
-
-    # 3. Penalize high-fee assets to minimize cost drag
-    # (Property = 35 bps, Gold = 25 bps)
-    signal["SA_PROPERTY"] *= 0.3
-    signal["GOLD"] *= 0.5
-
-    # Standardize cross-sectionally
-    if signal.std() > 1e-6:
-        signal = (signal - signal.mean()) / signal.std()
-    else:
-        signal = pd.Series(0.0, index=assets)
-
-    return signal
+    # Standardize signal
+    score = signal.reindex(hist.assets).fillna(0.0)
+    if score.std() > 0:
+        score = (score - score.mean()) / score.std()
+        
+    return score
 
 
 def make_legal(weights: pd.Series, hist) -> pd.Series:
@@ -173,29 +181,19 @@ def make_legal(weights: pd.Series, hist) -> pd.Series:
 
 
 def generate_weights(hist, prev_weights, params):
-    """Return the six portfolio weights to hold on hist.date."""
     bm = hist.benchmark
 
-    # not enough history to estimate anything: sit on the benchmark
     if len(hist.returns) < 260:
         return bm.to_dict()
 
-    # 1. signal -> target weights around the benchmark
     signal = build_signal(hist, params)
     target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
 
-    # Rebalance only when target differs significantly from previous weight
+    # Slow trade speed minimizes transaction drag
     prev = prev_weights.reindex(hist.assets)
-    diff = target - prev
-    
-    # Inertia filter: ignore minor rebalance noise to eliminate cost drag
-    thresh = float(params["rebal_threshold"])
-    adjusted_target = prev.copy()
-    for asset in hist.assets:
-        if abs(diff[asset]) > thresh:
-            adjusted_target[asset] = target[asset]
+    w = prev + float(params["trade_speed"]) * (target - prev)
 
-    return make_legal(adjusted_target, hist).to_dict()
+    return make_legal(w, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
