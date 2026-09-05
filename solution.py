@@ -49,8 +49,9 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "tilt_scale": 0.06,      # Active tilt aggressiveness (~12-15% active weight)
-    "rebal_thresh": 0.012,   # Rebalance threshold filter to minimize cost drag
+    "vol_days": 20,         # Short lookback -> dynamic, fast-changing signals
+    "tilt_size": 0.08,      # Target larger active tilts
+    "trade_speed": 0.50,    # Close 50% of weight gap daily (high turnover)
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -88,59 +89,23 @@ GOLD_CAP = 0.10
 
 
 def build_signal(hist, params) -> pd.Series:
-    """
-    Combines long-term risk metrics with macro regime indicators.
-    """
+    """Fast-moving, short-horizon risk-adjusted signal."""
     assets = hist.assets
     returns = hist.returns
-    macro = hist.macro
+    lookback = int(params["vol_days"])
 
-    # Require minimum historical history
-    if len(returns) < 252:
+    if len(returns) < lookback:
         return pd.Series(0.0, index=assets)
 
-    # 1. Long-Term Risk Normalization (Using full history)
-    # Volatility estimated across all available past data
-    long_term_vol = returns.std() * np.sqrt(252)
-    long_term_vol = long_term_vol.replace(0.0, np.nan).fillna(0.12)
+    # Short-term 20-day return momentum normalized by realized volatility
+    recent_ret = (1 + returns.tail(lookback)).prod() - 1.0
+    vol = returns.tail(lookback).std() * np.sqrt(252)
+    vol = vol.replace(0.0, np.nan).fillna(0.12)
 
-    # Long-Term Sharpe/Return Expectation
-    # Assets with higher long-term risk-adjusted returns get baseline preference
-    mean_ret = returns.mean() * 252
-    base_signal = mean_ret / long_term_vol
+    signal = recent_ret / vol
 
-    # 2. Dynamic Macro Regimes
-    macro_tilt = pd.Series(0.0, index=assets)
-    if len(macro) >= 60:
-        latest = macro.iloc[-1]
-        past_60 = macro.iloc[-60]
-
-        # A. Term Spread (SA Yield Curve) -> Shift between Bonds and Cash
-        sa_10y = latest.get("sa_10y", 9.5)
-        sa_repo = latest.get("sa_repo", 7.0)
-        spread = (sa_10y - sa_repo) / 100.0
-
-        macro_tilt["SA_BONDS"] += spread * 1.5
-        macro_tilt["SA_CASH"] -= spread * 1.5
-
-        # B. Rand FX Trend (USD/ZAR 60-day change) -> Rand Shock Protection
-        usdzar_now = latest.get("usdzar", 18.0)
-        usdzar_past = past_60.get("usdzar", usdzar_now)
-        zar_change = (usdzar_now / usdzar_past) - 1.0
-
-        macro_tilt["GLOBAL_EQUITY"] += zar_change * 1.0
-        macro_tilt["GOLD"] += zar_change * 1.0
-
-    # Combined composite signal
-    raw_signal = base_signal + macro_tilt
-
-    # Cost-Awareness Penalties (Property = 35 bps, Gold = 25 bps fee penalty)
-    raw_signal["SA_PROPERTY"] *= 0.25
-    raw_signal["GOLD"] *= 0.50
-
-    # Cross-sectional standardization
-    if raw_signal.std() > 1e-6:
-        signal = (raw_signal - raw_signal.mean()) / raw_signal.std()
+    if signal.std() > 1e-6:
+        signal = (signal - signal.mean()) / signal.std()
     else:
         signal = pd.Series(0.0, index=assets)
 
@@ -197,27 +162,21 @@ def make_legal(weights: pd.Series, hist) -> pd.Series:
 
 
 def generate_weights(hist, prev_weights, params):
-    """Return portfolio weights to hold on hist.date."""
+    """Generates portfolio weights with aggressive daily rebalancing."""
     bm = hist.benchmark
 
-    if len(hist.returns) < 252:
+    if len(hist.returns) < int(params["vol_days"]):
         return bm.to_dict()
 
-    # Calculate optimal target
     signal = build_signal(hist, params)
-    target = make_legal(bm + float(params["tilt_scale"]) * signal, hist)
+    target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
 
-    # Inertia rebalance filter: Only execute trades that exceed the rebalance threshold
+    # Rebalance aggressively toward target every single day
     prev = prev_weights.reindex(hist.assets)
-    diff = target - prev
-    thresh = float(params["rebal_thresh"])
+    speed = float(params["trade_speed"])
+    w = prev + speed * (target - prev)
 
-    adjusted_target = prev.copy()
-    for asset in hist.assets:
-        if abs(diff[asset]) > thresh:
-            adjusted_target[asset] = target[asset]
-
-    return make_legal(adjusted_target, hist).to_dict()
+    return make_legal(w, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
